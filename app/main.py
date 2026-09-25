@@ -37,11 +37,14 @@ app = FastAPI(
         "序号严格递增、偏移有限），同箱同版本原样重交幂等、异内容 409；"
         "GET /boxes/{box_code}/calibration-trajectory 按锚点线性插值给出校准温度，"
         "缺报序号不补事件，且不改写原始事件或现有状态与分析结果\n"
+        "- 校准版本切换影响审计：GET /boxes/{box_code}/calibration-impact 比较两版校准"
+        "在区间内对事件越界结论的影响，仅统计结论改变的事件，序号连续且变化方向相同的"
+        "合成影响段（缺号断段、不补点），输出起止序号、事件数、原/新结论与最大校准温差（只读）\n"
         "- 群体遥测静默：GET /telemetry-outages 按去重箱号列表 + 共同序号区间检测"
         "相邻校正间隔严格超过阈值的静默区间，端点扫描输出至少指定数量箱同时静默的"
         "极大时间段及段内峰值同时静默数（只读）"
     ),
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -490,6 +493,60 @@ def get_box_calibration_trajectory(
             },
         )
     return result
+
+
+@app.get(
+    "/boxes/{box_code}/calibration-impact",
+    tags=["calibrations"],
+    response_model=schemas.CalibrationImpactResult,
+    summary="两版校准对区间事件越界结论的影响审计（只读，缺号断段不补点）",
+)
+def get_box_calibration_impact(
+    box_code: str,
+    db: DbSession,
+    from_version: Annotated[int, Query(ge=0, description="原校准版本号")],
+    to_version: Annotated[int, Query(ge=0, description="新校准版本号")],
+    seq_from: Annotated[int, Query(ge=0, description="起始序号（含）")],
+    seq_to: Annotated[int, Query(ge=0, description="结束序号（含）")],
+    temp_lower: Annotated[
+        float,
+        Query(allow_inf_nan=False, description="温度下限（℃），边界值算区间内"),
+    ],
+    temp_upper: Annotated[
+        float,
+        Query(allow_inf_nan=False, description="温度上限（℃），边界值算区间内"),
+    ],
+) -> schemas.CalibrationImpactResult:
+    if seq_from > seq_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_range",
+                "message": f"seq_from({seq_from}) 不能大于 seq_to({seq_to})",
+                "seq_from": seq_from,
+                "seq_to": seq_to,
+            },
+        )
+    if temp_lower > temp_upper:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_limits",
+                "message": f"temp_lower({temp_lower}) 不能大于 temp_upper({temp_upper})",
+                "temp_lower": temp_lower,
+                "temp_upper": temp_upper,
+            },
+        )
+    return services.calibration_impact(
+        db,
+        box_code.strip(),
+        from_version,
+        to_version,
+        seq_from,
+        seq_to,
+        temp_lower,
+        temp_upper,
+    )
 
 
 @app.get(

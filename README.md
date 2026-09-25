@@ -22,6 +22,14 @@
 缺报序号不补事件），逐条返回原温度、偏移和校准温度。校准结果**只用于该新接口**，
 不改写原始事件，也不影响现有状态与分析结果。
 
+此外支持**校准版本切换影响审计**：`GET /boxes/{box_code}/calibration-impact`
+接收 `from_version` / `to_version` / `seq_from` / `seq_to` / `temp_lower` / `temp_upper`，
+复用已存锚点的序号线性插值分别计算两版校准温度，按**低于下限 / 区间内（含边界）/
+高于上限**逐事件判定结论；仅统计两版**结论改变**的事件，把**序号连续且变化方向相同**
+的事件合成影响段（缺号断段、不补点），输出起止序号、事件数、原/新结论与
+**最大校准温差**。插值与阈值判断全程使用精确数值（`Fraction`），避免边界误判；
+缺版本或箱号返回 `404`，空区间返回空段。全程只读，保留现有校准及分析结果。
+
 此外支持**群体遥测静默检测**：`GET /telemetry-outages` 按去重后的箱号列表、
 共同序号区间、最大允许静默秒数与最少同时静默箱数，对每箱区间内实际事件做
 等权保序校正时间，把相邻校正间隔**严格大于**阈值的部分作为半开静默区间，
@@ -38,7 +46,7 @@
 │   ├── database.py        # 引擎/会话，启动建表
 │   ├── models.py          # BoxEvent、交接快照、温度漂移校准模型，(box_code, seq)、handoff_code、(box_code, version) 唯一约束
 │   ├── schemas.py         # 请求/响应模型与时间归一化
-│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 包含证明、交接快照冻结、温度漂移校准、群体遥测静默检测
+│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 包含证明、交接快照冻结、温度漂移校准、校准版本切换影响审计、群体遥测静默检测
 │   └── main.py            # FastAPI 路由
 ├── Dockerfile
 ├── docker-compose.yml
@@ -123,6 +131,7 @@ APP_PORT=9000 docker compose up -d --build
 | POST | `/calibrations`                 | 按箱号 + 版本号保存不可变温度漂移校准锚点列表（至少 2 点、序号严格递增，幂等） |
 | GET  | `/boxes/{box_code}/calibrations/{version}` | 查询某箱某版本的不可变校准锚点列表 |
 | GET  | `/boxes/{box_code}/calibration-trajectory` | 指定版本与序号区间的校准轨迹（锚点间按序号线性插值，不改原始记录） |
+| GET  | `/boxes/{box_code}/calibration-impact` | 两版校准对区间事件越界结论的影响审计（结论改变的事件按序号连续 + 同向合成影响段，只读） |
 | GET  | `/telemetry-outages` | 多箱群体遥测静默检测（端点扫描，输出同时静默箱数达标的极大时间段与峰值，只读） |
 
 ### 上报事件
@@ -1021,6 +1030,116 @@ curl -i 'http://localhost:8000/boxes/BOX-CAL/calibration-trajectory?version=99&s
 curl -i 'http://localhost:8000/boxes/BOX-CAL/calibration-trajectory?version=1&seq_from=9&seq_to=1'
 ```
 
+## 校准版本切换影响审计（calibration-impact）
+
+`GET /boxes/{box_code}/calibration-impact`（默认访问端口 **8000**，如
+`http://localhost:8000/boxes/BOX-CAL/calibration-impact`）审计**从某版校准切换到
+另一版**后，区间事件的越界结论发生了哪些变化：复用两版已存锚点分别计算校准温度，
+仅统计**结论改变**的事件并合成**影响段**。全程**只读**：不写库、不改写原始事件、
+校准数据与任何既有分析结果，补报后重查即重算。
+
+计算规则：
+
+- 只取闭区间 `[seq_from, seq_to]` 内**实际存在**的事件（按 `seq` 升序），
+  **缺报序号不补事件**；区间无事件返回 `event_count=0`、`segments=[]`（空段）。
+- 每条事件分别用 `from_version` / `to_version` 的锚点求偏移：相邻锚点间按序号
+  **线性插值**，区间两端沿用最近锚点偏移（钳平，不外推）；
+  **校准温度 = 原温度 + 偏移**。
+- 逐事件按校准温度判定结论：**低于下限** `below_lower`（`< temp_lower`）、
+  **区间内** `in_range`（含边界，`temp_lower <= 温度 <= temp_upper`）、
+  **高于上限** `above_upper`（`> temp_upper`）。
+- **仅统计两版结论不同的事件**；把**序号连续**（seq 逐一递增）且**变化方向**
+  （原结论 → 新结论）**相同**的事件合成一个影响段；**缺号即断段、不补点**，
+  方向不同的相邻事件也各自成段。
+- 每段输出起止序号、事件数、原/新结论与**最大校准温差**
+  （段内两版校准温度之差的最大绝对值，℃）。
+- 插值与阈值判断全程用 `Fraction` 精确计算（float 原值无损转为有理数），
+  恰等于上下限的边界值稳定判为区间内，不会因浮点误差误判。
+
+查询参数：
+
+| 参数           | 说明                                                             |
+| -------------- | ---------------------------------------------------------------- |
+| `from_version` | 原校准版本号（非负整数）；该箱该版本不存在 → `404`               |
+| `to_version`   | 新校准版本号（非负整数）；该箱该版本不存在 → `404`               |
+| `seq_from` / `seq_to` | 序号区间，**均为整数且含端点**，必须 `>= 0` 且 `seq_from <= seq_to` |
+| `temp_lower` / `temp_upper` | 温度下/上限（℃），须为**有限数值**且 `temp_lower <= temp_upper`；边界值算区间内 |
+
+返回字段：
+
+| 字段                    | 说明                                                       |
+| ----------------------- | ---------------------------------------------------------- |
+| `event_count`           | 区间内实际事件条数（缺报序号不补事件）                     |
+| `changed_event_count`   | 两版校准下结论不同的事件数（仅这些事件计入影响段）         |
+| `segment_count`         | 影响段数（即 `segments` 长度）                             |
+| `segments[]`            | 影响段列表（按起始序号升序）                               |
+
+`segments[]` 中每段包含：`start_seq` / `end_seq`（起止事件序号，含）、
+`event_count`（段内结论改变的事件数）、`from_conclusion` / `to_conclusion`
+（原/新结论：`below_lower` / `in_range` / `above_upper`）、
+`max_calibrated_delta`（段内两版校准温度之差的最大绝对值，℃）。
+
+错误情况：箱号不存在（从未上报过）返回 `404`（`box_not_found`）；
+任一校准版本不存在返回 `404`（`calibration_not_found`，`detail.version` 指出缺失版本）；
+缺少参数、参数非法（含 `seq_from > seq_to`、`temp_lower > temp_upper`、
+`NaN`/`Infinity` 等）返回 `422`。
+
+```bash
+# 接上文 BOX-CAL（事件 seq 0/5/10/15，原始温度均 -5.0℃）：
+# v1 锚点 0->0.0、10->1.0 已保存；再保存 v2：0->0.0、10->3.0（漂移修正更大）
+curl -X POST http://localhost:8000/calibrations \
+  -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-CAL","version":2,"anchors":[
+        {"seq":0,"temp_offset":0.0},
+        {"seq":10,"temp_offset":3.0}]}'
+
+# 审计从 v1 切换到 v2 后，区间 [0,20] 内结论相对阈值 [-4.5, -3.5] 的变化
+curl 'http://localhost:8000/boxes/BOX-CAL/calibration-impact?from_version=1&to_version=2&seq_from=0&seq_to=20&temp_lower=-4.5&temp_upper=-3.5'
+```
+
+响应（v1 下 seq 5/10/15 校准温度为 -4.5/-4.0/-4.0 均在区间内；v2 下为
+-3.5/-2.0/-2.0：seq 5 恰为上限 -3.5 仍算区间内（边界精确判定），
+seq 10/15 变为高于上限。seq 10 与 15 序号不连续（缺 11..14），断为两段）：
+
+```json
+{
+  "box_code": "BOX-CAL",
+  "from_version": 1,
+  "to_version": 2,
+  "seq_from": 0,
+  "seq_to": 20,
+  "temp_lower": -4.5,
+  "temp_upper": -3.5,
+  "event_count": 4,
+  "changed_event_count": 2,
+  "segment_count": 2,
+  "segments": [
+    {"start_seq": 10, "end_seq": 10, "event_count": 1,
+     "from_conclusion": "in_range", "to_conclusion": "above_upper",
+     "max_calibrated_delta": 2.0},
+    {"start_seq": 15, "end_seq": 15, "event_count": 1,
+     "from_conclusion": "in_range", "to_conclusion": "above_upper",
+     "max_calibrated_delta": 2.0}
+  ]
+}
+```
+
+```bash
+# 空区间（箱号存在但区间内无事件）-> 200，空段
+curl 'http://localhost:8000/boxes/BOX-CAL/calibration-impact?from_version=1&to_version=2&seq_from=100&seq_to=200&temp_lower=-4.5&temp_upper=-3.5'
+# {"event_count":0,"changed_event_count":0,"segment_count":0,"segments":[], ...}
+
+# 箱号不存在 -> 404（box_not_found）
+curl -i 'http://localhost:8000/boxes/NO-SUCH-BOX/calibration-impact?from_version=1&to_version=2&seq_from=0&seq_to=1&temp_lower=-4.5&temp_upper=-3.5'
+
+# 任一版本不存在 -> 404（calibration_not_found，detail.version 指出缺失版本）
+curl -i 'http://localhost:8000/boxes/BOX-CAL/calibration-impact?from_version=1&to_version=99&seq_from=0&seq_to=20&temp_lower=-4.5&temp_upper=-3.5'
+
+# 参数非法（seq_from > seq_to、temp_lower > temp_upper、NaN/Infinity 等）-> 422
+curl -i 'http://localhost:8000/boxes/BOX-CAL/calibration-impact?from_version=1&to_version=2&seq_from=9&seq_to=1&temp_lower=-4.5&temp_upper=-3.5'
+curl -i 'http://localhost:8000/boxes/BOX-CAL/calibration-impact?from_version=1&to_version=2&seq_from=0&seq_to=20&temp_lower=-3.5&temp_upper=-4.5'
+```
+
 ## 群体遥测静默检测（telemetry-outages）
 
 `GET /telemetry-outages`（默认访问端口 **8000**，如
@@ -1224,6 +1343,17 @@ curl -i -G 'http://localhost:8000/telemetry-outages' \
   区间两端沿用最近锚点偏移而不外推，缺报序号不补事件。校准结果仅在
   `/boxes/{box_code}/calibration-trajectory` 返回，**不写库、不改写原始事件，
   也不影响最新状态、交接快照与既有分析接口**；补报事件后重查即基于最新数据重算。
+- **校准影响审计只读**：`/boxes/{box_code}/calibration-impact` 复用区间事件查询
+  （按 `seq` 升序、缺号不补点）与同一套锚点序号线性插值，对每条事件分别计算
+  `from_version` / `to_version` 两版的校准温度（原温度 + 偏移），并按
+  `temp_lower` / `temp_upper` 判定 低于下限 / 区间内（含边界）/ 高于上限 结论。
+  插值与阈值比较全程用 `Fraction` 精确计算（float 原值无损转为有理数），
+  恰等于上下限的边界值稳定判为区间内，不会因浮点误差误判。仅两版结论不同的
+  事件计入结果；序号连续（seq 逐一递增）且变化方向（原结论 → 新结论）相同的
+  事件合成一个影响段，缺号或方向变化即断段、不补点；每段给出起止序号、事件数、
+  原/新结论与段内最大校准温差（两版校准温度之差的最大绝对值）。箱号不存在或
+  任一版本缺失返回 404，空区间返回空段；全程只读 `box_events` 与校准表，
+  不写库，保留现有校准及分析结果。
 - **群体静默检测只读**：`/telemetry-outages` 先在路由层对 `box_codes` 去空白、
   按请求顺序去重并拒绝空/超长箱号（422）；服务层一次性校验全部箱号存在
   （任一缺失即 404，`missing_box_codes` 一并返回），再单次查询所有箱区间内

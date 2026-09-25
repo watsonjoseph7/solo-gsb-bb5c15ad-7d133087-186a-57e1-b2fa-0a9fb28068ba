@@ -1,4 +1,4 @@
-"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照、交接箱单对账、温度漂移校准、群体遥测静默检测。"""
+"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照、交接箱单对账、温度漂移校准、校准版本切换影响审计、群体遥测静默检测。"""
 import hashlib
 import json
 import math
@@ -1246,6 +1246,142 @@ def calibration_trajectory(
         seq_to=seq_to,
         event_count=len(events),
         points=points,
+    )
+
+
+# 校准影响审计的逐事件结论取值
+IMPACT_BELOW_LOWER = "below_lower"
+IMPACT_IN_RANGE = "in_range"
+IMPACT_ABOVE_UPPER = "above_upper"
+
+
+def _impact_conclusion(calibrated: Fraction, lower: Fraction, upper: Fraction) -> str:
+    """校准温度相对阈值区间的结论（恰等于上下限的边界值算区间内）。"""
+    if calibrated < lower:
+        return IMPACT_BELOW_LOWER
+    if calibrated > upper:
+        return IMPACT_ABOVE_UPPER
+    return IMPACT_IN_RANGE
+
+
+def calibration_impact(
+    db: Session,
+    box_code: str,
+    from_version: int,
+    to_version: int,
+    seq_from: int,
+    seq_to: int,
+    temp_lower: float,
+    temp_upper: float,
+) -> schemas.CalibrationImpactResult:
+    """审计两版校准对区间事件越界结论的影响（只读即时计算，不写库）。
+
+    - 箱号不存在（从未上报过）：抛 404（box_not_found）；
+      任一校准版本不存在：抛 404（calibration_not_found）
+    - 只取闭区间 [seq_from, seq_to] 内按 seq 升序的实际事件，缺号不补点；
+      区间无事件返回空段（segments=[]）
+    - 每条事件分别用 from_version / to_version 的锚点按序号线性插值得到偏移
+      （两端沿用最近锚点，不外推），校准温度 = 原温度 + 偏移；
+      按 低于下限 / 区间内（含边界）/ 高于上限 判定结论
+    - 仅统计两版结论不同的事件；把序号连续（seq 逐一递增）且变化方向
+      （原结论 -> 新结论）相同的事件合成一个影响段，缺号即断段、不补点
+    - 每段给出起止序号、事件数、原/新结论与段内最大校准温差
+      （两版校准温度之差的最大绝对值）
+    - 插值与阈值比较全程用 Fraction 精确计算，避免边界误判；
+      结果只用于本接口返回，不改写原始事件、校准数据与任何既有分析结果
+    """
+    events = _events_in_range(db, box_code, seq_from, seq_to)
+    if events is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "box_not_found", "box_code": box_code},
+        )
+
+    loaded_from = _load_calibration(db, box_code, from_version)
+    if loaded_from is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "calibration_not_found",
+                "box_code": box_code,
+                "version": from_version,
+            },
+        )
+    loaded_to = _load_calibration(db, box_code, to_version)
+    if loaded_to is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "calibration_not_found",
+                "box_code": box_code,
+                "version": to_version,
+            },
+        )
+    _, anchors_from = loaded_from
+    _, anchors_to = loaded_to
+
+    from_seqs = [a.seq for a in anchors_from]
+    from_offsets = [Fraction(a.temp_offset) for a in anchors_from]
+    to_seqs = [a.seq for a in anchors_to]
+    to_offsets = [Fraction(a.temp_offset) for a in anchors_to]
+    lower = Fraction(temp_lower)
+    upper = Fraction(temp_upper)
+
+    # 逐事件计算两版校准温度与结论，仅保留结论改变的事件
+    # (seq, 原结论, 新结论, 两版校准温度之差的绝对值)
+    changed: list[tuple[int, str, str, Fraction]] = []
+    for event in events:
+        base = Fraction(event.temperature)
+        cal_from = base + _anchor_offset_fraction(from_seqs, from_offsets, event.seq)
+        cal_to = base + _anchor_offset_fraction(to_seqs, to_offsets, event.seq)
+        concl_from = _impact_conclusion(cal_from, lower, upper)
+        concl_to = _impact_conclusion(cal_to, lower, upper)
+        if concl_from == concl_to:
+            continue
+        changed.append((event.seq, concl_from, concl_to, abs(cal_to - cal_from)))
+
+    # 序号连续且变化方向（原结论 -> 新结论）相同的事件合成影响段；缺号断段
+    segments: list[schemas.CalibrationImpactSegment] = []
+    open_seg: schemas.CalibrationImpactSegment | None = None
+    open_delta = Fraction(0)
+    prev_seq = 0
+    for seq, concl_from, concl_to, delta in changed:
+        if (
+            open_seg is not None
+            and seq == prev_seq + 1
+            and concl_from == open_seg.from_conclusion
+            and concl_to == open_seg.to_conclusion
+        ):
+            open_seg.end_seq = seq
+            open_seg.event_count += 1
+            if delta > open_delta:
+                open_delta = delta
+                open_seg.max_calibrated_delta = float(delta)
+        else:
+            open_seg = schemas.CalibrationImpactSegment(
+                start_seq=seq,
+                end_seq=seq,
+                event_count=1,
+                from_conclusion=concl_from,
+                to_conclusion=concl_to,
+                max_calibrated_delta=float(delta),
+            )
+            open_delta = delta
+            segments.append(open_seg)
+        prev_seq = seq
+
+    return schemas.CalibrationImpactResult(
+        box_code=box_code,
+        from_version=from_version,
+        to_version=to_version,
+        seq_from=seq_from,
+        seq_to=seq_to,
+        temp_lower=temp_lower,
+        temp_upper=temp_upper,
+        event_count=len(events),
+        changed_event_count=len(changed),
+        segment_count=len(segments),
+        segments=segments,
     )
 
 

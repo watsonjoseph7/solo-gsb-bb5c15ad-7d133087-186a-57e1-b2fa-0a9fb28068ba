@@ -11,8 +11,8 @@ handoff_code 全局唯一，作为幂等键；明细行在创建时一次性写�
 
 calibration_sets / calibration_anchors：按箱号 + 版本号保存的温度漂移校准
 锚点列表。(box_code, version) 唯一，作为幂等键；锚点行在创建时一次性写入，
-之后只增不改。校准结果只被 /calibration-trajectory 接口读取，不会改写
-box_events、快照或任何既有分析结果。
+之后只增不改。校准结果只被 /calibration-trajectory 与 /calibration-impact
+接口读取，不会改写 box_events、快照或任何既有分析结果。
 """
 from datetime import datetime
 

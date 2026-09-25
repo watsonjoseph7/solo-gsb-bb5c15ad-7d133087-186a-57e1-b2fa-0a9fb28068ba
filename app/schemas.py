@@ -393,6 +393,49 @@ class CalibrationTrajectoryResult(BaseModel):
     )
 
 
+class CalibrationImpactSegment(BaseModel):
+    start_seq: int = Field(..., description="影响段起始事件序号（含）")
+    end_seq: int = Field(..., description="影响段结束事件序号（含）")
+    event_count: int = Field(..., description="段内结论改变的事件数")
+    from_conclusion: str = Field(
+        ...,
+        description=(
+            "原校准版本下的结论：below_lower=低于下限，"
+            "in_range=区间内（含边界），above_upper=高于上限"
+        ),
+    )
+    to_conclusion: str = Field(
+        ..., description="新校准版本下的结论（取值同 from_conclusion）"
+    )
+    max_calibrated_delta: float = Field(
+        ..., description="段内两版校准温度之差的最大绝对值（℃）"
+    )
+
+
+class CalibrationImpactResult(BaseModel):
+    box_code: str = Field(..., description="周转箱箱号")
+    from_version: int = Field(..., description="原校准版本号")
+    to_version: int = Field(..., description="新校准版本号")
+    seq_from: int = Field(..., description="查询起始序号（含）")
+    seq_to: int = Field(..., description="查询结束序号（含）")
+    temp_lower: float = Field(..., description="温度下限（℃），边界值算区间内")
+    temp_upper: float = Field(..., description="温度上限（℃），边界值算区间内")
+    event_count: int = Field(
+        ..., description="区间内实际事件条数（缺报序号不补事件）"
+    )
+    changed_event_count: int = Field(
+        ..., description="两版校准下结论不同的事件数（仅这些事件计入影响段）"
+    )
+    segment_count: int = Field(..., description="影响段数（即 segments 长度）")
+    segments: list[CalibrationImpactSegment] = Field(
+        ...,
+        description=(
+            "影响段列表（按起始序号升序）：序号连续且变化方向"
+            "（原结论 -> 新结论）相同的事件合并为一段，缺号断段、不补点"
+        ),
+    )
+
+
 class TelemetryOutageSegment(BaseModel):
     start_time: datetime = Field(
         ..., description="段起点 UTC 时间（含）：同时静默箱数首次达到要求数量的时刻"
