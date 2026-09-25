@@ -28,6 +28,15 @@
 再对各箱区间做**端点扫描**，输出至少指定数量箱同时静默的**极大时间段**及
 段内峰值同时静默数（端点相接的合格段合并）。全程只读，不写库、不改任何记录。
 
+此外支持**校准版本切换影响审计**：`GET /boxes/{box_code}/calibration-impact`
+同时复用该箱**两个已存校准版本**的锚点（相邻锚点间按序号线性插值、两端沿用
+最近锚点偏移），对序号区间内的实际事件分别计算两版校准温度，按
+**低于下限 / 区间内（含边界）/ 高于上限**判定结论；只统计两版结论不同的事件，
+把**序号连续且变化方向相同**的事件合成影响段（缺号断段、不补点），逐段输出
+起止序号、事件数、原/新结论与段内最大校准温差。插值与阈值判断全程使用精确数值，
+边界不会误判；缺版本或箱号返回 `404`，空区间返回空段。全程只读，保留现有
+校准及全部分析结果。
+
 ## 目录结构
 
 ```
@@ -38,7 +47,7 @@
 │   ├── database.py        # 引擎/会话，启动建表
 │   ├── models.py          # BoxEvent、交接快照、温度漂移校准模型，(box_code, seq)、handoff_code、(box_code, version) 唯一约束
 │   ├── schemas.py         # 请求/响应模型与时间归一化
-│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 包含证明、交接快照冻结、温度漂移校准、群体遥测静默检测
+│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 包含证明、交接快照冻结、温度漂移校准、校准版本切换影响审计、群体遥测静默检测
 │   └── main.py            # FastAPI 路由
 ├── Dockerfile
 ├── docker-compose.yml
@@ -123,6 +132,7 @@ APP_PORT=9000 docker compose up -d --build
 | POST | `/calibrations`                 | 按箱号 + 版本号保存不可变温度漂移校准锚点列表（至少 2 点、序号严格递增，幂等） |
 | GET  | `/boxes/{box_code}/calibrations/{version}` | 查询某箱某版本的不可变校准锚点列表 |
 | GET  | `/boxes/{box_code}/calibration-trajectory` | 指定版本与序号区间的校准轨迹（锚点间按序号线性插值，不改原始记录） |
+| GET  | `/boxes/{box_code}/calibration-impact` | 校准版本切换影响审计：两版锚点分别插值判结论，合成结论改变的影响段（精确数值，只读） |
 | GET  | `/telemetry-outages` | 多箱群体遥测静默检测（端点扫描，输出同时静默箱数达标的极大时间段与峰值，只读） |
 
 ### 上报事件
@@ -1021,6 +1031,137 @@ curl -i 'http://localhost:8000/boxes/BOX-CAL/calibration-trajectory?version=99&s
 curl -i 'http://localhost:8000/boxes/BOX-CAL/calibration-trajectory?version=1&seq_from=9&seq_to=1'
 ```
 
+## 校准版本切换影响审计（calibration-impact）
+
+`GET /boxes/{box_code}/calibration-impact`（默认访问端口 **8000**，
+如 `http://localhost:8000/boxes/BOX-IMP/calibration-impact`）审计**从一个校准版本
+切换到另一个版本**后，区间内各事件的温度结论是否改变。全程**只读**：不写库、
+不改锚点、不改写原始事件，也不影响最新状态、交接快照与其他既有分析结果；
+补报事件或新增校准版本后重查即基于最新数据重算。
+
+计算规则（与 `calibration-trajectory` 复用同一套已存锚点插值逻辑）：
+
+- 同时加载该箱的 **`from_version`（原版本）与 `to_version`（新版本）**两份锚点；
+  任一版本不存在返回 `404`（`detail.missing_versions` 列出全部缺失版本）。
+- 只取闭区间 `[seq_from, seq_to]` 内**实际存在**的事件（按 `seq` 升序），
+  **缺报序号不补事件**（空区间返回空段）。
+- 每条事件分别用两版锚点计算校准温度：序号落在锚点上取该点偏移，相邻锚点之间按
+  **序号**线性插值，早于首锚点 / 晚于末锚点时两端沿用最近锚点偏移（不外推）。
+- 按给定阈值把校准温度判为三档结论：**低于下限** `below`、**区间内（含边界）**
+  `normal`、**高于上限** `above`。插值与阈值比较全程使用精确有理数
+  （`Fraction`），校准温度**恰等于**下/上限时稳定判为 `normal`，不会因浮点
+  误差在边界上误判。
+- **只保留两版结论不同的事件**；把其中**序号连续**（后一条 `seq` 恰为前一条 `seq+1`）
+  且**变化方向相同**（`from_status -> to_status` 一致）的事件**合成一个影响段**；
+  一旦遇到**缺号**或结论未变的事件即**断段，不为缺号造点**，变化方向不同也分开成段。
+- 每段给出起止序号、段内事件数、原结论 `from_status`、新结论 `to_status` 与
+  **最大校准温差** `max_calibration_delta = max(|新版本校准温度 − 原版本校准温度|)`。
+
+查询参数：
+
+| 参数            | 说明                                                                |
+| --------------- | ------------------------------------------------------------------- |
+| `from_version`  | 原校准版本号（非负整数），该箱该版本须已存在，否则 `404`            |
+| `to_version`    | 新校准版本号（非负整数），同上；允许与原版本相同（此时无结论改变）  |
+| `seq_from` / `seq_to` | 序号区间，**均为整数且含端点**，必须 `>= 0` 且 `seq_from <= seq_to` |
+| `temp_lower`    | 温度下限（℃），**有限数值**，恰等于算区间内                         |
+| `temp_upper`    | 温度上限（℃），**有限数值**，须 `>= temp_lower`，恰等于算区间内     |
+
+返回字段：
+
+| 字段                          | 说明                                                          |
+| ----------------------------- | ------------------------------------------------------------- |
+| `event_count`                 | 区间内实际事件总数（缺报不补）                                |
+| `changed_event_count`         | 两版结论不同的事件数（各段 `event_count` 之和）               |
+| `segment_count`               | 影响段数（即 `segments` 长度；无改变时为 0）                  |
+| `segments[].start_seq`/`end_seq` | 影响段起止事件序号（含端点；缺号断段，不补点）             |
+| `segments[].event_count`      | 段内序号连续且变化方向相同的事件数                            |
+| `segments[].from_status`/`to_status` | 原/新结论：`below`/`normal`/`above`，段内各事件方向一致 |
+| `segments[].max_calibration_delta` | 段内两版校准温差的最大绝对值（℃）                         |
+
+启动与端口：先按上文方式一键启动 `docker compose up -d --build`
+（本地不用 Docker 时为 `uvicorn app.main:app --host 0.0.0.0 --port 8000`），
+服务监听 **8000** 端口，以下示例访问 `http://localhost:8000`。
+
+```bash
+# 保存两版校准（BOX-IMP）：
+# v1 锚点 seq=0/8 偏移均为 0（校准温度=原温度）
+# v2 锚点 seq=0 偏移 0、seq=8 偏移 1（每号 +0.125 线性漂移，8 之后沿用 1.0）
+curl -X POST http://localhost:8000/calibrations -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-IMP","version":1,"anchors":[
+        {"seq":0,"temp_offset":0.0},
+        {"seq":8,"temp_offset":0.0}]}'
+curl -X POST http://localhost:8000/calibrations -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-IMP","version":2,"anchors":[
+        {"seq":0,"temp_offset":0.0},
+        {"seq":8,"temp_offset":1.0}]}'
+
+# 上报事件（原始温度；故意缺 seq=8）：
+# seq=0 温度 4.0（恰上限，两版都 normal）；seq=1..4 温度 3.5（v2 仍在区间）；
+# seq=5/6/7 温度 3.5（v2 = 4.125/4.25/4.375，全部 normal->above）；
+# seq=9 温度 -0.5（v1 below；v2 晚于末锚点沿用偏移 1.0 -> 0.5，below->normal）
+for s in 0 1 2 3 4 5 6 7 9; do
+  t=$([ "$s" = "9" ] && echo '-0.5' || echo '3.5'); [ "$s" = "0" ] && t=4.0
+  curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+    -d "{\"box_code\":\"BOX-IMP\",\"seq\":$s,\"temperature\":$t,
+         \"event_time\":\"2026-09-25T03:00:$(printf %02d $s)+00:00\"}"
+done
+
+# 审计 v1 -> v2，阈值 [0, 4]，序号区间 [0,10]
+curl 'http://localhost:8000/boxes/BOX-IMP/calibration-impact?from_version=1&to_version=2&seq_from=0&seq_to=10&temp_lower=0&temp_upper=4'
+```
+
+响应（seq=5/6/7 序号连续、方向相同，合成一段，最大温差 0.875；
+seq=9 因缺 seq=8 断段且方向不同，单独成段，温差恰为 1.0）：
+
+```json
+{
+  "box_code": "BOX-IMP",
+  "from_version": 1,
+  "to_version": 2,
+  "seq_from": 0,
+  "seq_to": 10,
+  "temp_lower": 0.0,
+  "temp_upper": 4.0,
+  "event_count": 9,
+  "changed_event_count": 4,
+  "segment_count": 2,
+  "segments": [
+    {
+      "start_seq": 5,
+      "end_seq": 7,
+      "event_count": 3,
+      "from_status": "normal",
+      "to_status": "above",
+      "max_calibration_delta": 0.875
+    },
+    {
+      "start_seq": 9,
+      "end_seq": 9,
+      "event_count": 1,
+      "from_status": "below",
+      "to_status": "normal",
+      "max_calibration_delta": 1.0
+    }
+  ]
+}
+```
+
+```bash
+# 区间内无事件（缺报不补点）-> 200，event_count=0、changed_event_count=0、segments=[]
+curl 'http://localhost:8000/boxes/BOX-IMP/calibration-impact?from_version=1&to_version=2&seq_from=100&seq_to=200&temp_lower=0&temp_upper=4'
+
+# 任一校准版本不存在 -> 404，detail.missing_versions 列出全部缺失版本
+curl -i 'http://localhost:8000/boxes/BOX-IMP/calibration-impact?from_version=1&to_version=99&seq_from=0&seq_to=1&temp_lower=0&temp_upper=4'
+
+# 箱号从未上报过事件 -> 404（box_not_found）
+curl -i 'http://localhost:8000/boxes/NO-SUCH-BOX/calibration-impact?from_version=1&to_version=2&seq_from=0&seq_to=1&temp_lower=0&temp_upper=4'
+
+# 参数非法（seq_from > seq_to、下限大于上限、NaN/Infinity、缺参数等）-> 422
+curl -i 'http://localhost:8000/boxes/BOX-IMP/calibration-impact?from_version=1&to_version=2&seq_from=9&seq_to=1&temp_lower=0&temp_upper=4'
+curl -i 'http://localhost:8000/boxes/BOX-IMP/calibration-impact?from_version=1&to_version=2&seq_from=0&seq_to=1&temp_lower=4&temp_upper=0'
+```
+
 ## 群体遥测静默检测（telemetry-outages）
 
 `GET /telemetry-outages`（默认访问端口 **8000**，如
@@ -1224,6 +1365,17 @@ curl -i -G 'http://localhost:8000/telemetry-outages' \
   区间两端沿用最近锚点偏移而不外推，缺报序号不补事件。校准结果仅在
   `/boxes/{box_code}/calibration-trajectory` 返回，**不写库、不改写原始事件，
   也不影响最新状态、交接快照与既有分析接口**；补报事件后重查即基于最新数据重算。
+- **校准版本切换影响审计只读**：`/boxes/{box_code}/calibration-impact` 先加载
+  from/to 两版已存锚点（任一缺失即 404，`missing_versions` 一并返回），再复用
+  `calibration-trajectory` 同款 `_anchor_offset_fraction` 序号线性插值
+  （两端钳平、不外推）与区间实际事件读取（缺号不补点），箱号从未上报则 404。
+  每条事件的两版校准温度与下/上限的比较全程用 `Fraction` 精确进行：三档结论为
+  below（严格低于下限）、normal（区间内含边界）、above（严格高于上限），
+  恰等于边界时稳定落入 normal，杜绝浮点边界误判。仅收集两版结论不同的事件，
+  按 `seq` 升序单趟扫描合成影响段——后一条序号恰为前一条 +1 且
+  `(from_status, to_status)` 相同才延续，否则（缺号、结论未变或方向变化）断段，
+  段内维护两版校准温差绝对值的最大值。审计只读取 `box_events` 与校准锚点，
+  不写库、不改锚点，现有校准数据与全部分析结果原样保留。
 - **群体静默检测只读**：`/telemetry-outages` 先在路由层对 `box_codes` 去空白、
   按请求顺序去重并拒绝空/超长箱号（422）；服务层一次性校验全部箱号存在
   （任一缺失即 404，`missing_box_codes` 一并返回），再单次查询所有箱区间内
